@@ -36,12 +36,48 @@ import json
 import logging
 import urllib
 from pprint import pformat
-from time import sleep
+from time import sleep, perf_counter
 import pymongo
+import time
+
+from pymongo import monitoring
+
 
 # Import TransactionOptions from pymongo.client_session or
 # pymongo.synchronous.client_session depending on the version of pymongo
 from pymongo.client_session import TransactionOptions
+
+class MyCommandListener(monitoring.CommandListener):
+    def succeeded(self, event: monitoring.CommandSucceededEvent):
+        # print(event)
+        if event.command_name == "commitTransaction":
+            print(f"Transaction committed.")
+        # print(f"Command {event.command_name} succeeded")
+    def failed(self, event: monitoring.CommandFailedEvent):
+        print(f"Command {event.command_name} failed")
+    def started(self, event: monitoring.CommandStartedEvent):
+        if "startTransaction" in event.command:
+            print(f"Transaction started, txnNum: {event.command['txnNumber']}")
+        # print(json.dumps(event.command, indent=2, sort_keys=True, default=str))
+        # del event.command["$clusterTime"]
+        # del event.command["lsid"]
+        print(event.command)
+
+        # print(f"Command {event.command_name} started")
+
+    # Include other event method implementations here
+
+class MyServerListener(monitoring.ServerListener):
+    def heartbeat_started(self, event: monitoring.ServerHeartbeatStartedEvent):
+        print(f"Heartbeat started on server with id: {event.connection_id}")
+
+    # Include other event method implementations here
+
+class MyPoolListener(monitoring.ConnectionPoolListener):
+    def connection_created(self, event: monitoring.ConnectionCreatedEvent):
+        print(f"Connection {event.connection_id} created")
+
+    # Include other event method implementations here
 
 import constants
 from .abstractdriver import AbstractDriver
@@ -205,7 +241,8 @@ class MongodbDriver(AbstractDriver):
         "secondary_reads":  ("If true, we will allow secondary reads", True),
         "retry_writes":     ("If true, we will enable retryable writes", True),
         "causal_consistency":  ("If true, we will perform causal reads ", True),
-        "shards":          ("If >1 then sharded", "1")
+        "shards":          ("If >1 then sharded", "1"),
+        "trace_new_order_db": ("If true, record every DB request in doNewOrderTxn (list of op/collection/duration)", False),
     }
     DENORMALIZED_TABLES = [
         constants.TABLENAME_ORDERS,
@@ -237,6 +274,9 @@ class MongodbDriver(AbstractDriver):
         self.result_doc = {}
         self.warehouses = 0
         self.shards = 1
+        self.trace_new_order_db = False
+        self._current_trace = []
+        self._last_new_order_trace = []
 
         ## Create member mapping to collections
         for name in constants.ALL_TABLES:
@@ -272,6 +312,7 @@ class MongodbDriver(AbstractDriver):
         self.retry_writes = config['retry_writes'] == 'True'
         self.secondary_reads = config['secondary_reads'] == 'True'
         self.agg = config['agg'] == 'True'
+        self.trace_new_order_db = config.get('trace_new_order_db', False) in (True, 'True', 'true', '1')
 
         if self.secondary_reads:
             self.read_preference = "nearest"
@@ -304,10 +345,15 @@ class MongodbDriver(AbstractDriver):
         real_uri = uri[0:pindex]+userpassword+uri[pindex:]
         display_uri = uri[0:pindex]+usersecret+uri[pindex:]
 
+        # listeners = [MyCommandListener()]
+        listeners = []
+# client = MongoClient("<connection URI>", event_listeners=listeners)
+
         self.client = pymongo.MongoClient(real_uri,
                                           retryWrites=self.retry_writes,
                                           readPreference=self.read_preference,
-                                          readConcernLevel=self.read_concern)
+                                          readConcernLevel=self.read_concern,
+                                          event_listeners=listeners)
 
         self.result_doc['before']=self.get_server_status()
 
@@ -440,6 +486,7 @@ class MongodbDriver(AbstractDriver):
     ## ----------------------------------------------
     def doDelivery(self, params):
         # two options, option one (default) is to run a db transaction for each of 10 orders
+        # print('doDeliveryTxn')
 
         if self.all_in_one_txn:
             (value, retries) = self.run_transaction_with_retries(self._doDelivery10Txn, "DELIVERY", params)
@@ -571,6 +618,24 @@ class MongodbDriver(AbstractDriver):
         (value, retries) = self.run_transaction_with_retries(self._doNewOrderTxn, "NEW_ORDER", params)
         return (value, retries)
 
+    def _trace_db(self, op, collection_name, fn):
+        """Run fn() and, if trace_new_order_db is enabled, record op/collection/duration."""
+        # print("trace_db", op, collection_name, fn)
+        return fn()
+        time.sleep(0.01)
+        if not self.trace_new_order_db:
+            return fn()
+        start = perf_counter()
+        # print(op, collection_name, perf_counter() - start)
+        try:
+            return fn()
+        finally:
+            self._current_trace.append({
+                "op": op,
+                "collection": collection_name,
+                "duration_sec": round(perf_counter() - start, 6),
+            })
+
     def _doNewOrderTxn(self, s, params):
         w_id = params["w_id"]
         d_id = params["d_id"]
@@ -582,6 +647,14 @@ class MongodbDriver(AbstractDriver):
         s_dist_col = "S_DIST_%02d" % d_id
         comment = "NEW_ORDER"
 
+        # print("doNewOrderTxn")
+        curr_time = time.time()
+
+        ONESHOT_UPDATES = []
+
+        # if self.trace_new_order_db:
+        #     self._current_trace = []
+
         assert i_ids, "No matching i_ids found for new order"
         assert len(i_ids) == len(i_w_ids), "different number of i_ids and i_w_ids"
         assert len(i_ids) == len(i_qtys), "different number of i_ids and i_qtys"
@@ -591,31 +664,37 @@ class MongodbDriver(AbstractDriver):
         ## ----------------
 
         # getDistrict
-        district_project = {"_id":0, "D_ID":1, "D_W_ID":1, "D_TAX": 1, "D_NEXT_O_ID": 1}
-        if self.find_and_modify:
-            d = self.district.find_one_and_update({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment},
-                                                  {"$inc":{"D_NEXT_O_ID":1}},
-                                                  projection=district_project,
-                                                  sort=[("NO_O_ID", 1)],
-                                                  session=s)
-            if not d:
-                d1 = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": "new order did not find district"})
-                print(d1, w_id, d_id, c_id, i_ids, i_w_ids, s_dist_col)
-            assert d, "Couldn't find district in new order w_id %d d_id %d" % (w_id, d_id)
-        else:
-            d = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment},
-                                       district_project, session=s)
-            assert d, "Couldn't find district in new order w_id %d d_id %d" % (w_id, d_id)
-            # incrementNextOrderId
-            d["$comment"] = comment
-            self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
+        district_project = {"_id":1, "D_ID":1, "D_W_ID":1, "D_TAX": 1, "D_NEXT_O_ID": 1}
+        # if self.find_and_modify:
+        #     d = self.district.find_one_and_update({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment},
+        #                                           {"$inc":{"D_NEXT_O_ID":1}},
+        #                                           projection=district_project,
+        #                                           sort=[("NO_O_ID", 1)],
+        #                                           session=s)
+        #     if not d:
+        #         d1 = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": "new order did not find district"})
+        #         print(d1, w_id, d_id, c_id, i_ids, i_w_ids, s_dist_col)
+        #     assert d, "Couldn't find district in new order w_id %d d_id %d" % (w_id, d_id)
+        # else:
+        da = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment}, session=s)
+        # print('da', da)
+        d = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment},
+                                    district_project, session=s)
+        assert d, "Couldn't find district in new order w_id %d d_id %d" % (w_id, d_id)
+        # print('d', d)
+
+
         ## IF
         d_tax = d["D_TAX"]
         d_next_o_id = d["D_NEXT_O_ID"]
 
+
+
+
         # fetch matching items and see if they are all valid
-        if self.shards > 1: i_w_id = w_id
-        else: i_w_id = 0
+        # if self.shards > 1: i_w_id = w_id
+        # else: 
+        i_w_id = 0
         items = list(self.item.find({"I_ID": {"$in": i_ids}, "I_W_ID": i_w_id, "$comment": comment},
                                     {"_id":0, "I_ID": 1, "I_PRICE": 1, "I_NAME": 1, "I_DATA": 1},
                                     session=s))
@@ -631,26 +710,27 @@ class MongodbDriver(AbstractDriver):
         xxi_ids = tuple(map(lambda o: o['I_ID'], items))
         items = sorted(items, key=lambda x: xxi_ids.index(x['I_ID']))
 
-        # getWarehouseTaxRate
+
+       # getWarehouseTaxRate
         w = self.warehouse.find_one({"W_ID": w_id, "$comment": comment}, {"_id":0, "W_TAX": 1}, session=s)
         assert w, "Couldn't find warehouse in new order w_id %d" % (w_id)
         w_tax = w["W_TAX"]
+        # sleep(0.080)
 
         # getCustomer
         c = self.customer.find_one({"C_ID": c_id, "C_D_ID": d_id, "C_W_ID": w_id, "$comment": comment},
                                    {"C_DISCOUNT": 1, "C_LAST": 1, "C_CREDIT": 1}, session=s)
         assert c, "Couldn't find customer in new order"
         c_discount = c["C_DISCOUNT"]
+        # sleep(0.080)
 
-        ## ----------------
-        ## Insert Order Information
-        ## ----------------
+
+
+
+
+
         ol_cnt = len(i_ids)
         o_carrier_id = constants.NULL_CARRIER_ID
-
-        # createNewOrder
-
-        self.new_order.insert_one({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, session=s)
 
         all_local = 1 if ([w_id] * len(i_w_ids)) == i_w_ids else 0
         o = {"O_ID": d_next_o_id, "O_ENTRY_D": o_entry_d,
@@ -686,6 +766,36 @@ class MongodbDriver(AbstractDriver):
         assert len(all_stocks) == ol_cnt, "all_stocks len %d != ol_cnt %d" % (len(all_stocks), ol_cnt)
         xxxi_ids = tuple(map(lambda o: (o['S_I_ID'], o['S_W_ID']), all_stocks))
         all_stocks = sorted(all_stocks, key=lambda x: xxxi_ids.index((x['S_I_ID'], x["S_W_ID"])))
+
+
+
+
+        # incrementNextOrderId
+        d["$comment"] = comment
+        self.district.update_one({"_id":da["_id"]}, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
+
+        ### Append update.
+        ONESHOT_UPDATES.append(pymongo.UpdateOne({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment}, {"$inc": {"D_NEXT_O_ID": 1}}))
+
+
+
+
+
+        ## ----------------
+        ## Insert Order Information
+        ## ----------------
+
+
+
+
+        # createNewOrder
+
+        self.new_order.insert_one({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, session=s)
+
+        ### Append update.
+        # 'd_next_o_id' in this case is dependent on a previous read.
+        ONESHOT_UPDATES.append(pymongo.InsertOne({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}))
+
 
         ## ----------------
         ## Insert Order Line, Stock Item Information
@@ -745,8 +855,8 @@ class MongodbDriver(AbstractDriver):
             else:
                 si["$comment"] = comment
                 self.stock.update_one(si, stock_write_update, session=s)
-
-            if i_data.find(constants.ORIGINAL_STRING) != -1 and s_data.find(constants.ORIGINAL_STRING) != -1:
+            # print("i_data", i_data)
+            if constants.ORIGINAL_STRING in i_data and constants.ORIGINAL_STRING in s_data:
                 brand_generic = 'B'
             else:
                 brand_generic = 'G'
@@ -760,20 +870,20 @@ class MongodbDriver(AbstractDriver):
                   "OL_SUPPLY_W_ID": ol_supply_w_id, "OL_DELIVERY_D": o_entry_d,
                   "OL_QUANTITY": ol_quantity, "OL_AMOUNT": ol_amount, "OL_DIST_INFO": s_dist_xx}
 
-            if self.denormalize:
+            # if self.denormalize:
                 # createOrderLine
-                o[constants.TABLENAME_ORDER_LINE].append(ol)
-            else:
-                ol["OL_D_ID"] = d_id
-                ol["OL_W_ID"] = w_id
+            o[constants.TABLENAME_ORDER_LINE].append(ol)
+            # else:
+            #     ol["OL_D_ID"] = d_id
+            #     ol["OL_W_ID"] = w_id
 
-                # createOrderLine
-                if self.batch_writes:
-                    order_line_writes.append(ol)
-                else:
-                    self.order_line.insert_one(ol, session=s)
-                ## IF
-            ## IF
+            #     # createOrderLine
+            #     if self.batch_writes:
+            #         order_line_writes.append(ol)
+            #     else:
+            #         self.order_line.insert_one(ol, session=s)
+            #     ## IF
+            # ## IF
 
             ## Add the info to be returned
             item_data.append((i_name, s_quantity, brand_generic, i_price, ol_amount))
@@ -783,8 +893,8 @@ class MongodbDriver(AbstractDriver):
         total *= (1 - c_discount) * (1 + w_tax + d_tax)
 
         if self.batch_writes:
-            if not self.denormalize:
-                self.order_line.insert_many(order_line_writes, session=s)
+            # if not self.denormalize:
+            #     self.order_line.insert_many(order_line_writes, session=s)
             self.stock.bulk_write(stock_writes, session=s)
         ## IF
 
@@ -794,6 +904,12 @@ class MongodbDriver(AbstractDriver):
         ## Pack up values the client is missing (see TPC-C 2.4.3.5)
         misc = [(w_tax, d_tax, d_next_o_id, total)]
 
+        # if self.trace_new_order_db and self._current_trace:
+            # self._last_new_order_trace = self._current_trace
+            # logging.debug("NEW_ORDER DB trace (%d requests): %s", len(self._current_trace), self._current_trace)
+
+        # print("doNewOrderTxn done")
+        # print("doNewOrderTxn time", (time.time() - curr_time) * 1000, "ms")
         return [c, misc, item_data]
 
     ## ----------------------------------------------
@@ -884,6 +1000,8 @@ class MongodbDriver(AbstractDriver):
         c_last = params["c_last"]
         h_date = params["h_date"]
         comment = "PAYMENT"
+
+        # print("doPaymentTxn")
 
         # getDistrict
         district_project = {"D_NAME": 1,
@@ -1100,6 +1218,7 @@ class MongodbDriver(AbstractDriver):
         except pymongo.errors.OperationFailure as exc:
             # exc.code in (24, 112, 244):  LockTimeout, WriteConflict, TransactionAborted
             if exc.has_error_label("TransientTransactionError"):
+                print(exc)
                 logging.debug("OperationFailure with error code: %d (%s) during operation: %s",
                               exc.code, exc.details, name)
                 return (False, None)
