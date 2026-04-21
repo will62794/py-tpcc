@@ -766,6 +766,35 @@ class MongodbDriver(AbstractDriver):
         d["$comment"] = comment
 
 
+        ## ----------------
+        ## Insert Order Information
+        ## ----------------
+        ol_cnt = len(i_ids)
+        o_carrier_id = constants.NULL_CARRIER_ID
+
+        ## ----------------
+        ## OPTIMIZATION:
+        ## If all of the items are at the same warehouse, then we'll issue a single
+        ## request to get their information, otherwise we'll still issue a single request
+        ## ----------------
+        item_w_list = list(zip(i_ids, i_w_ids))
+        stock_project = {"_id":0, "S_I_ID": 1, "S_W_ID": 1,
+                         "S_QUANTITY": 1, "S_DATA": 1, "S_YTD": 1,
+                         "S_ORDER_CNT": 1, "S_REMOTE_CNT": 1, s_dist_col: 1}
+        if all_local:
+            #############################################################################################################
+            all_stocks = list(self.stock.find({"S_I_ID": {"$in": i_ids}, "S_W_ID": w_id, "$comment": comment},
+                                              stock_project,
+                                              session=s))
+        else:
+            field_list = ["S_I_ID", "S_W_ID"]
+            search_list = [dict(zip(field_list, ze)) for ze in item_w_list]
+            #############################################################################################################
+            all_stocks = list(self.stock.find({"$or": search_list, "$comment": comment},
+                                              stock_project,
+                                              session=s))
+
+
         #############################################################################################################
         self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
 
@@ -801,6 +830,11 @@ class MongodbDriver(AbstractDriver):
         # getWarehouseTaxRate
 
 
+        ## IF
+        assert len(all_stocks) == ol_cnt, "all_stocks len %d != ol_cnt %d" % (len(all_stocks), ol_cnt)
+        all_stocks = sorted(all_stocks, key=lambda x: item_w_list.index((x['S_I_ID'], x["S_W_ID"])))
+
+
         #############################################################################################################
         w = self.warehouse.find_one({"W_ID": w_id, "$comment": comment}, {"_id":0, "W_TAX": 1}, session=s)
         assert w, "Couldn't find warehouse in new order w_id %d" % (w_id)
@@ -815,11 +849,6 @@ class MongodbDriver(AbstractDriver):
 
 
 
-        ## ----------------
-        ## Insert Order Information
-        ## ----------------
-        ol_cnt = len(i_ids)
-        o_carrier_id = constants.NULL_CARRIER_ID
 
         # createNewOrder
 
@@ -835,30 +864,6 @@ class MongodbDriver(AbstractDriver):
         o["O_W_ID"] = w_id
         o["O_C_ID"] = c_id
 
-        ## ----------------
-        ## OPTIMIZATION:
-        ## If all of the items are at the same warehouse, then we'll issue a single
-        ## request to get their information, otherwise we'll still issue a single request
-        ## ----------------
-        item_w_list = list(zip(i_ids, i_w_ids))
-        stock_project = {"_id":0, "S_I_ID": 1, "S_W_ID": 1,
-                         "S_QUANTITY": 1, "S_DATA": 1, "S_YTD": 1,
-                         "S_ORDER_CNT": 1, "S_REMOTE_CNT": 1, s_dist_col: 1}
-        if all_local:
-            #############################################################################################################
-            all_stocks = list(self.stock.find({"S_I_ID": {"$in": i_ids}, "S_W_ID": w_id, "$comment": comment},
-                                              stock_project,
-                                              session=s))
-        else:
-            field_list = ["S_I_ID", "S_W_ID"]
-            search_list = [dict(zip(field_list, ze)) for ze in item_w_list]
-            #############################################################################################################
-            all_stocks = list(self.stock.find({"$or": search_list, "$comment": comment},
-                                              stock_project,
-                                              session=s))
-        ## IF
-        assert len(all_stocks) == ol_cnt, "all_stocks len %d != ol_cnt %d" % (len(all_stocks), ol_cnt)
-        all_stocks = sorted(all_stocks, key=lambda x: item_w_list.index((x['S_I_ID'], x["S_W_ID"])))
 
         ## ----------------
         ## Insert Order Line, Stock Item Information
