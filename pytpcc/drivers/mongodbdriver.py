@@ -237,6 +237,8 @@ class MongodbDriver(AbstractDriver):
         self.no_global_items = False
         self.shards = 0
 
+        self.oneshot_mode = True
+
         ## Create member mapping to collections
         for name in constants.ALL_TABLES:
             self.__dict__[name.lower()] = None
@@ -725,6 +727,234 @@ class MongodbDriver(AbstractDriver):
         (value, retries) = self.run_transaction_with_retries(self._doNewOrderTxn, "NEW_ORDER", params)
         return (value, retries)
 
+    def _doNewOrderTxn_oneshot(self, s, params):
+        w_id = params["w_id"]
+        d_id = params["d_id"]
+        c_id = params["c_id"]
+        o_entry_d = params["o_entry_d"]
+        i_ids = params["i_ids"]
+        i_w_ids = params["i_w_ids"]
+        i_qtys = params["i_qtys"]
+        s_dist_col = "S_DIST_%02d" % d_id
+        comment = "NEW_ORDER"
+
+        assert i_ids, "No matching i_ids found for new order"
+        assert len(i_ids) == len(i_w_ids), "different number of i_ids and i_w_ids"
+        assert len(i_ids) == len(i_qtys), "different number of i_ids and i_qtys"
+
+        all_local = 1 if ([w_id] * len(i_w_ids)) == i_w_ids else 0
+
+        ## ----------------
+        ## Collect Information from WAREHOUSE, DISTRICT, and CUSTOMER
+        ## ----------------
+
+        # Assume fixed configuration.
+        assert self.batch_writes
+        assert self.denormalize
+
+        # getDistrict
+        district_project = {"_id":0, "D_ID":1, "D_W_ID":1, "D_TAX": 1, "D_NEXT_O_ID": 1}
+
+
+        #############################################################################################################
+        d = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment},
+                                    district_project, session=s)
+        assert d, "Couldn't find district in new order w_id %d d_id %d" % (w_id, d_id)
+
+
+        # incrementNextOrderId
+        d["$comment"] = comment
+
+
+        #############################################################################################################
+        self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
+
+
+        ## IF
+        d_tax = d["D_TAX"]
+        d_next_o_id = d["D_NEXT_O_ID"]
+
+        # fetch matching items and see if they are all valid
+        if self.shards > 0: i_w_id = w_id-(w_id-1)%(self.warehouses/self.shards) # get_i_w(w_id)
+        else: i_w_id = 0
+        if self.no_global_items:
+            i_w_id = 1
+
+
+        #############################################################################################################
+        items = list(self.item.find({"I_ID": {"$in": i_ids}, "I_W_ID": i_w_id, "$comment": comment},
+                                    {"_id":0, "I_ID": 1, "I_PRICE": 1, "I_NAME": 1, "I_DATA": 1},
+                                    session=s))
+
+
+        ## TPCC defines 1% of neworder gives a wrong itemid, causing rollback.
+        ## Note that this will happen with 1% of transactions on purpose.
+        if len(items) != len(i_ids):
+            if not self.no_transactions:
+                s.abort_transaction()
+            logging.debug("1% Abort transaction: " +  constants.INVALID_ITEM_MESSAGE)
+            #print constants.INVALID_ITEM_MESSAGE + ", Aborting transaction (ok for 1%)"
+            return None
+        ## IF
+        items = sorted(items, key=lambda x: i_ids.index(x['I_ID']))
+
+        # getWarehouseTaxRate
+
+
+        #############################################################################################################
+        w = self.warehouse.find_one({"W_ID": w_id, "$comment": comment}, {"_id":0, "W_TAX": 1}, session=s)
+        assert w, "Couldn't find warehouse in new order w_id %d" % (w_id)
+        w_tax = w["W_TAX"]
+
+        # getCustomer
+        #############################################################################################################
+        c = self.customer.find_one({"C_ID": c_id, "C_D_ID": d_id, "C_W_ID": w_id, "$comment": comment},
+                                   {"C_DISCOUNT": 1, "C_LAST": 1, "C_CREDIT": 1}, session=s)
+        assert c, "Couldn't find customer in new order"
+        c_discount = c["C_DISCOUNT"]
+
+
+
+        ## ----------------
+        ## Insert Order Information
+        ## ----------------
+        ol_cnt = len(i_ids)
+        o_carrier_id = constants.NULL_CARRIER_ID
+
+        # createNewOrder
+
+        #############################################################################################################
+        self.new_order.insert_one({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, session=s)
+
+        o = {"O_ID": d_next_o_id, "O_ENTRY_D": o_entry_d,
+             "O_CARRIER_ID": o_carrier_id, "O_OL_CNT": ol_cnt, "O_ALL_LOCAL": all_local}
+
+        o[constants.TABLENAME_ORDER_LINE] = []
+
+        o["O_D_ID"] = d_id
+        o["O_W_ID"] = w_id
+        o["O_C_ID"] = c_id
+
+        ## ----------------
+        ## OPTIMIZATION:
+        ## If all of the items are at the same warehouse, then we'll issue a single
+        ## request to get their information, otherwise we'll still issue a single request
+        ## ----------------
+        item_w_list = list(zip(i_ids, i_w_ids))
+        stock_project = {"_id":0, "S_I_ID": 1, "S_W_ID": 1,
+                         "S_QUANTITY": 1, "S_DATA": 1, "S_YTD": 1,
+                         "S_ORDER_CNT": 1, "S_REMOTE_CNT": 1, s_dist_col: 1}
+        if all_local:
+            #############################################################################################################
+            all_stocks = list(self.stock.find({"S_I_ID": {"$in": i_ids}, "S_W_ID": w_id, "$comment": comment},
+                                              stock_project,
+                                              session=s))
+        else:
+            field_list = ["S_I_ID", "S_W_ID"]
+            search_list = [dict(zip(field_list, ze)) for ze in item_w_list]
+            #############################################################################################################
+            all_stocks = list(self.stock.find({"$or": search_list, "$comment": comment},
+                                              stock_project,
+                                              session=s))
+        ## IF
+        assert len(all_stocks) == ol_cnt, "all_stocks len %d != ol_cnt %d" % (len(all_stocks), ol_cnt)
+        all_stocks = sorted(all_stocks, key=lambda x: item_w_list.index((x['S_I_ID'], x["S_W_ID"])))
+
+        ## ----------------
+        ## Insert Order Line, Stock Item Information
+        ## ----------------
+        item_data = []
+        total = 0
+        # we already fetched all items so we should never need to go to self.item again
+        # iterate over every line item
+        # if self.batch_writes is set then write once per collection
+        stock_writes = []
+        order_line_writes = []
+        ## IF
+        for i in range(ol_cnt):
+            ol_number = i + 1
+            ol_supply_w_id = i_w_ids[i]
+            ol_i_id = i_ids[i]
+            ol_quantity = i_qtys[i]
+
+            item_info = items[i]
+            i_name = item_info["I_NAME"]
+            i_data = item_info["I_DATA"]
+            i_price = item_info["I_PRICE"]
+
+            si = all_stocks[i]
+
+            assert si, "stock item not found"
+
+            s_quantity = si["S_QUANTITY"]
+            s_ytd = si["S_YTD"]
+            s_order_cnt = si["S_ORDER_CNT"]
+            s_remote_cnt = si["S_REMOTE_CNT"]
+            s_data = si["S_DATA"]
+            s_dist_xx = si[s_dist_col] # Fetches data from the s_dist_[d_id] column
+
+            ## Update stock
+            s_ytd += ol_quantity
+            if s_quantity >= ol_quantity + 10:
+                s_quantity = s_quantity - ol_quantity
+            else:
+                s_quantity = s_quantity + 91 - ol_quantity
+            ## IF
+
+            s_order_cnt += 1
+
+            if ol_supply_w_id != w_id:
+                s_remote_cnt += 1
+
+            # updateStock
+            stock_write_update = {"$set": {"S_QUANTITY": s_quantity,
+                                           "S_YTD": s_ytd,
+                                           "S_ORDER_CNT": s_order_cnt,
+                                           "S_REMOTE_CNT": s_remote_cnt}}
+            si["$comment"] = comment
+            #############################################################################################################
+            stock_writes.append(pymongo.UpdateOne(si, stock_write_update))
+
+            if i_data.find(constants.ORIGINAL_STRING) != -1 and s_data.find(constants.ORIGINAL_STRING) != -1:
+                brand_generic = 'B'
+            else:
+                brand_generic = 'G'
+            ## IF
+
+            ## Transaction profile states to use "ol_quantity * i_price"
+            ol_amount = ol_quantity * i_price
+            total += ol_amount
+
+            ol = {"OL_O_ID": d_next_o_id, "OL_NUMBER": ol_number, "OL_I_ID": ol_i_id,
+                  "OL_SUPPLY_W_ID": ol_supply_w_id, "OL_DELIVERY_D": o_entry_d,
+                  "OL_QUANTITY": ol_quantity, "OL_AMOUNT": ol_amount, "OL_DIST_INFO": s_dist_xx}
+
+            o[constants.TABLENAME_ORDER_LINE].append(ol)
+
+                ## IF
+            ## IF
+
+            ## Add the info to be returned
+            item_data.append((i_name, s_quantity, brand_generic, i_price, ol_amount))
+        ## FOR
+
+        ## Adjust the total for the discount
+        total *= (1 - c_discount) * (1 + w_tax + d_tax)
+
+        #############################################################################################################
+        self.stock.bulk_write(stock_writes, session=s)
+        ## IF
+
+        # createOrder
+        #############################################################################################################
+        self.orders.insert_one(o, session=s)
+
+        ## Pack up values the client is missing (see TPC-C 2.4.3.5)
+        misc = [(w_tax, d_tax, d_next_o_id, total)]
+
+        return [c, misc, item_data]        
+
+
     def _doNewOrderTxn(self, s, params):
         w_id = params["w_id"]
         d_id = params["d_id"]
@@ -739,6 +969,9 @@ class MongodbDriver(AbstractDriver):
         assert i_ids, "No matching i_ids found for new order"
         assert len(i_ids) == len(i_w_ids), "different number of i_ids and i_w_ids"
         assert len(i_ids) == len(i_qtys), "different number of i_ids and i_qtys"
+
+        if self.oneshot_mode:
+            return self._doNewOrderTxn_oneshot(s, params)
 
         ## ----------------
         ## Collect Information from WAREHOUSE, DISTRICT, and CUSTOMER
