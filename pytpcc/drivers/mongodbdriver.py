@@ -1283,6 +1283,115 @@ class MongodbDriver(AbstractDriver):
         (value, retries) = self.run_transaction_with_retries(self._doPaymentTxn, "PAYMENT", params)
         return (value, retries)
 
+    def _doPaymentTxn_oneshot(self, s, params):
+        w_id = params["w_id"]
+        d_id = params["d_id"]
+        h_amount = params["h_amount"]
+        c_w_id = params["c_w_id"]
+        c_d_id = params["c_d_id"]
+        c_id = params["c_id"]
+        c_last = params["c_last"]
+        h_date = params["h_date"]
+        comment = "PAYMENT"
+
+        # getDistrict
+        district_project = {"D_NAME": 1,
+                            "D_STREET_1": 1,
+                            "D_STREET_2": 1,
+                            "D_CITY": 1,
+                            "D_STATE": 1,
+                            "D_ZIP": 1}
+
+        d = self.district.find_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
+                                    district_project,
+                                    session=s)
+        assert d, "Couldn't find district in payment w_id %d d_id %d" % (w_id, d_id)
+        # updateDistrictBalance
+        self.district.update_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
+                                    {"$inc": {"D_YTD": h_amount}}, session=s)
+        ## IF
+
+        warehouse_project = {"W_NAME": 1,
+                             "W_STREET_1": 1,
+                             "W_STREET_2": 1,
+                             "W_CITY": 1,
+                             "W_STATE": 1,
+                             "W_ZIP": 1}
+
+        # getWarehouse
+        w = self.warehouse.find_one({"W_ID": w_id, "$comment": comment},
+                                    warehouse_project,
+                                    session=s)
+        assert w, "Couldn't find warehouse in payment w_id %d" % (w_id)
+        # updateWarehouseBalance
+        self.warehouse.update_one({"W_ID": w_id, "$comment": comment},
+                                    {"$inc": {"W_YTD": h_amount}},
+                                    session=s)
+        ## IF
+
+        search_fields = {"C_W_ID": c_w_id, "C_D_ID": c_d_id, "$comment": comment}
+        return_fields = {"C_BALANCE": 0, "C_YTD_PAYMENT": 0, "C_PAYMENT_CNT": 0}
+
+        if c_id != None:
+            # getCustomerByCustomerId
+            search_fields["C_ID"] = c_id
+            c = self.customer.find_one(search_fields, return_fields, session=s)
+            assert c, "No customer in payment w_id %d d_id %d c_id %d" % (w_id, d_id, c_id)
+        else:
+            # getCustomersByLastName
+            # Get the midpoint customer's id
+            search_fields['C_LAST'] = c_last
+            all_customers = list(self.customer.find(search_fields, return_fields, session=s))
+            namecnt = len(all_customers)
+            assert namecnt > 0, "No matching customer w %d d %d clast %s" % (w_id, d_id, c_last)
+            index = (namecnt-1)//2
+            c = all_customers[index]
+            c_id = c["C_ID"]
+        ## IF
+
+        assert c_id != None, "Didn't find any matching c_id"
+
+        c_data = c["C_DATA"]
+
+        # Build CUSTOMER update command
+        customer_update = {"$inc": {"C_BALANCE": h_amount*-1,
+                                    "C_YTD_PAYMENT": h_amount,
+                                    "C_PAYMENT_CNT": 1}}
+
+        # Customer Credit Information
+        if c["C_CREDIT"] == constants.BAD_CREDIT:
+            new_data = " ".join(map(str, [c_id, c_d_id, c_w_id, d_id, w_id, h_amount]))
+            c_data = (new_data + "|" + c_data)
+            if len(c_data) > constants.MAX_C_DATA:
+                c_data = c_data[:constants.MAX_C_DATA]
+            customer_update["$set"] = {"C_DATA": c_data}
+        ## IF
+
+        # Concatenate w_name, four spaces, d_name
+        h_data = "%s    %s" % (w["W_NAME"], d["D_NAME"])
+
+        h = {"H_D_ID": d_id,
+             "H_W_ID": w_id,
+             "H_DATE": h_date,
+             "H_AMOUNT": h_amount,
+             "H_DATA": h_data}
+
+        # updateCustomer
+        self.customer.update_one({"C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, session=s)
+
+        # insertHistory
+        self.history.insert_one(h, session=s)
+
+        # TPC-C 2.5.3.3: Must display the following fields:
+        # W_ID, D_ID, C_ID, C_D_ID, C_W_ID, W_STREET_1, W_STREET_2, W_CITY, W_STATE, W_ZIP,
+        # D_STREET_1, D_STREET_2, D_CITY, D_STATE, D_ZIP, C_FIRST, C_MIDDLE, C_LAST, C_STREET_1,
+        # C_STREET_2, C_CITY, C_STATE, C_ZIP, C_PHONE, C_SINCE, C_CREDIT, C_CREDIT_LIM,
+        # C_DISCOUNT, C_BALANCE, the first 200 characters of C_DATA (only if C_CREDIT = "BC"),
+        # H_AMOUNT, and H_DATE.
+
+        # Hand back all the warehouse, district, and customer data
+        return [w, d, c]        
+
     def _doPaymentTxn(self, s, params):
         w_id = params["w_id"]
         d_id = params["d_id"]
@@ -1293,6 +1402,9 @@ class MongodbDriver(AbstractDriver):
         c_last = params["c_last"]
         h_date = params["h_date"]
         comment = "PAYMENT"
+
+        if self.oneshot_mode:
+            return self._doPaymentTxn_oneshot(s, params)
 
         # getDistrict
         district_project = {"D_NAME": 1,
