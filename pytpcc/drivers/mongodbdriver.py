@@ -753,12 +753,11 @@ class MongodbDriver(AbstractDriver):
         assert self.denormalize
 
         # getDistrict
-        district_project = {"_id":0, "D_ID":1, "D_W_ID":1, "D_TAX": 1, "D_NEXT_O_ID": 1}
+        district_project = {"_id":1, "D_ID":1, "D_W_ID":1, "D_TAX": 1, "D_NEXT_O_ID": 1}
 
 
         #############################################################################################################
-        d = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment},
-                                    district_project, session=s)
+        d = self.district.find_one({"D_ID": d_id, "D_W_ID": w_id, "$comment": comment}, district_project, session=s)
         assert d, "Couldn't find district in new order w_id %d d_id %d" % (w_id, d_id)
 
 
@@ -778,7 +777,7 @@ class MongodbDriver(AbstractDriver):
         ## request to get their information, otherwise we'll still issue a single request
         ## ----------------
         item_w_list = list(zip(i_ids, i_w_ids))
-        stock_project = {"_id":0, "S_I_ID": 1, "S_W_ID": 1,
+        stock_project = {"_id":1, "S_I_ID": 1, "S_W_ID": 1,
                          "S_QUANTITY": 1, "S_DATA": 1, "S_YTD": 1,
                          "S_ORDER_CNT": 1, "S_REMOTE_CNT": 1, s_dist_col: 1}
         if all_local:
@@ -844,6 +843,25 @@ class MongodbDriver(AbstractDriver):
         assert c, "Couldn't find customer in new order"
         c_discount = c["C_DISCOUNT"]
 
+
+
+        #######################
+        #######################
+        ### READ PHASE DONE ###
+        #######################
+        #######################
+
+
+        #
+        # After completing the read phase of this transaction, we should be able
+        # to know the full set of document ids that we are going to modify in
+        # the update phase.
+        #
+
+        docs_to_be_updated = [d] + all_stocks
+        # print("docs to be updated:")
+        # for doc in docs_to_be_updated:
+            # print(doc)
 
 
         #############################################################################################################
