@@ -795,9 +795,6 @@ class MongodbDriver(AbstractDriver):
                                               session=s))
 
 
-        #############################################################################################################
-        self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
-
 
         ## IF
         d_tax = d["D_TAX"]
@@ -849,6 +846,8 @@ class MongodbDriver(AbstractDriver):
 
 
 
+        #############################################################################################################
+        self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
 
         # createNewOrder
 
