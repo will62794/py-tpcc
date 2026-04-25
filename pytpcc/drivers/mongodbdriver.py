@@ -1300,15 +1300,14 @@ class MongodbDriver(AbstractDriver):
                             "D_STREET_2": 1,
                             "D_CITY": 1,
                             "D_STATE": 1,
-                            "D_ZIP": 1}
+                            "D_ZIP": 1,
+                            "_id": 1} # fine to include _id in projection as well?
 
         d = self.district.find_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
                                     district_project,
                                     session=s)
         assert d, "Couldn't find district in payment w_id %d d_id %d" % (w_id, d_id)
-        # updateDistrictBalance
-        self.district.update_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
-                                    {"$inc": {"D_YTD": h_amount}}, session=s)
+
         ## IF
 
         warehouse_project = {"W_NAME": 1,
@@ -1316,17 +1315,15 @@ class MongodbDriver(AbstractDriver):
                              "W_STREET_2": 1,
                              "W_CITY": 1,
                              "W_STATE": 1,
-                             "W_ZIP": 1}
+                             "W_ZIP": 1,
+                             "_id": 1} # fine to include _id in projection as well?
 
         # getWarehouse
         w = self.warehouse.find_one({"W_ID": w_id, "$comment": comment},
                                     warehouse_project,
                                     session=s)
         assert w, "Couldn't find warehouse in payment w_id %d" % (w_id)
-        # updateWarehouseBalance
-        self.warehouse.update_one({"W_ID": w_id, "$comment": comment},
-                                    {"$inc": {"W_YTD": h_amount}},
-                                    session=s)
+
         ## IF
 
         search_fields = {"C_W_ID": c_w_id, "C_D_ID": c_d_id, "$comment": comment}
@@ -1350,6 +1347,14 @@ class MongodbDriver(AbstractDriver):
         ## IF
 
         assert c_id != None, "Didn't find any matching c_id"
+
+        # updateWarehouseBalance
+        self.warehouse.update_one({"W_ID": w_id, "$comment": comment},
+                                    {"$inc": {"W_YTD": h_amount}},
+                                    session=s) # can update to specify by _id?
+        # updateDistrictBalance
+        self.district.update_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
+                                    {"$inc": {"D_YTD": h_amount}}, session=s) # can update to specify by _id?
 
         c_data = c["C_DATA"]
 
