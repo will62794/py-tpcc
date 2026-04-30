@@ -744,6 +744,9 @@ class MongodbDriver(AbstractDriver):
 
         all_local = 1 if ([w_id] * len(i_w_ids)) == i_w_ids else 0
 
+        db_name = self.database.name if self.database is not None else None
+   
+
         ## ----------------
         ## Collect Information from WAREHOUSE, DISTRICT, and CUSTOMER
         ## ----------------
@@ -864,13 +867,18 @@ class MongodbDriver(AbstractDriver):
             # print(doc)
 
 
+        oneshot_updates = []
+
+
         #############################################################################################################
-        self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
+        # self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
+        oneshot_updates.append(pymongo.UpdateOne(d, {"$inc": {"D_NEXT_O_ID": 1}}, namespace=f"{db_name}.district"))
 
         # createNewOrder
 
         #############################################################################################################
-        self.new_order.insert_one({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, session=s)
+        # self.new_order.insert_one({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, session=s)
+        oneshot_updates.append(pymongo.InsertOne({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, namespace=f"{db_name}.new_order"))
 
         o = {"O_ID": d_next_o_id, "O_ENTRY_D": o_entry_d,
              "O_CARRIER_ID": o_carrier_id, "O_OL_CNT": ol_cnt, "O_ALL_LOCAL": all_local}
@@ -935,7 +943,7 @@ class MongodbDriver(AbstractDriver):
                                            "S_REMOTE_CNT": s_remote_cnt}}
             si["$comment"] = comment
             #############################################################################################################
-            stock_writes.append(pymongo.UpdateOne(si, stock_write_update))
+            stock_writes.append(pymongo.UpdateOne(si, stock_write_update, namespace=f"{db_name}.stock"))
 
             if i_data.find(constants.ORIGINAL_STRING) != -1 and s_data.find(constants.ORIGINAL_STRING) != -1:
                 brand_generic = 'B'
@@ -964,12 +972,20 @@ class MongodbDriver(AbstractDriver):
         total *= (1 - c_discount) * (1 + w_tax + d_tax)
 
         #############################################################################################################
-        self.stock.bulk_write(stock_writes, session=s)
+        # self.stock.bulk_write(stock_writes, session=s)
+        oneshot_updates.extend(stock_writes)
         ## IF
 
         # createOrder
         #############################################################################################################
-        self.orders.insert_one(o, session=s)
+        # self.orders.insert_one(o, session=s)
+        oneshot_updates.append(pymongo.InsertOne(o, namespace=f"{db_name}.orders"))
+
+        #
+        # Execute all the updates in one bulk write.
+        #
+        self.client.bulk_write(oneshot_updates, session=s)
+
 
         ## Pack up values the client is missing (see TPC-C 2.4.3.5)
         misc = [(w_tax, d_tax, d_next_o_id, total)]
@@ -1294,6 +1310,8 @@ class MongodbDriver(AbstractDriver):
         h_date = params["h_date"]
         comment = "PAYMENT"
 
+        db_name = self.database.name if self.database is not None else None
+
         # getDistrict
         district_project = {"D_NAME": 1,
                             "D_STREET_1": 1,
@@ -1327,7 +1345,7 @@ class MongodbDriver(AbstractDriver):
         ## IF
 
         search_fields = {"C_W_ID": c_w_id, "C_D_ID": c_d_id, "$comment": comment}
-        return_fields = {"C_BALANCE": 0, "C_YTD_PAYMENT": 0, "C_PAYMENT_CNT": 0}
+        return_fields = {"C_BALANCE": 0, "C_YTD_PAYMENT": 0, "C_PAYMENT_CNT": 0, "_id": 1}
 
         if c_id != None:
             # getCustomerByCustomerId
@@ -1348,13 +1366,22 @@ class MongodbDriver(AbstractDriver):
 
         assert c_id != None, "Didn't find any matching c_id"
 
+        oneshot_updates = []
+
+
         # updateWarehouseBalance
-        self.warehouse.update_one({"W_ID": w_id, "$comment": comment},
+        # self.warehouse.update_one({"_id": w["_id"], "W_ID": w_id, "$comment": comment},
+        #                             {"$inc": {"W_YTD": h_amount}},
+        #                             session=s) # can update to specify by _id?
+        oneshot_updates.append(pymongo.UpdateOne({"_id": w["_id"], "W_ID": w_id, "$comment": comment},
                                     {"$inc": {"W_YTD": h_amount}},
-                                    session=s) # can update to specify by _id?
+                                    namespace=f"{db_name}.warehouse"))
         # updateDistrictBalance
-        self.district.update_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
-                                    {"$inc": {"D_YTD": h_amount}}, session=s) # can update to specify by _id?
+        # self.district.update_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
+        #                             {"$inc": {"D_YTD": h_amount}}, session=s) # can update to specify by _id?
+        oneshot_updates.append(pymongo.UpdateOne({"_id": d["_id"], "D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
+                                    {"$inc": {"D_YTD": h_amount}},
+                                    namespace=f"{db_name}.district"))
 
         c_data = c["C_DATA"]
 
@@ -1382,10 +1409,12 @@ class MongodbDriver(AbstractDriver):
              "H_DATA": h_data}
 
         # updateCustomer
-        self.customer.update_one({"C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, session=s)
+        # self.customer.update_one({"_id": c["_id"], "C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, session=s)
+        oneshot_updates.append(pymongo.UpdateOne({"_id": c["_id"], "C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, namespace=f"{db_name}.customer"))
 
         # insertHistory
-        self.history.insert_one(h, session=s)
+        # self.history.insert_one(h, session=s)
+        oneshot_updates.append(pymongo.InsertOne(h, namespace=f"{db_name}.history"))
 
         # TPC-C 2.5.3.3: Must display the following fields:
         # W_ID, D_ID, C_ID, C_D_ID, C_W_ID, W_STREET_1, W_STREET_2, W_CITY, W_STATE, W_ZIP,
@@ -1393,6 +1422,9 @@ class MongodbDriver(AbstractDriver):
         # C_STREET_2, C_CITY, C_STATE, C_ZIP, C_PHONE, C_SINCE, C_CREDIT, C_CREDIT_LIM,
         # C_DISCOUNT, C_BALANCE, the first 200 characters of C_DATA (only if C_CREDIT = "BC"),
         # H_AMOUNT, and H_DATE.
+
+        # Execute all the updates in one bulk write.
+        self.client.bulk_write(oneshot_updates, session=s)
 
         # Hand back all the warehouse, district, and customer data
         return [w, d, c]        
@@ -1624,9 +1656,10 @@ class MongodbDriver(AbstractDriver):
             with session.start_transaction():
                 return (True, txn_callback(session, params))
         except pymongo.errors.OperationFailure as exc:
+            # EVEN after a bunch of retries, if we succeed eventually, we don't consider this an "abort".
             # exc.code in (24, 112, 244):  LockTimeout, WriteConflict, TransactionAborted
             if exc.has_error_label("TransientTransactionError"):
-                logging.debug("OperationFailure with error code: %d (%s) during operation: %s",
+                logging.info("OperationFailure with error code: %d (%s) during operation: %s",
                               exc.code, exc.details, name)
                 return (False, None)
             logging.error("Failed with unknown OperationFailure: %d", exc.code)
@@ -1653,7 +1686,7 @@ class MongodbDriver(AbstractDriver):
                 (ok, value) = self.run_transaction(txn_callback, s, name, params)
                 if ok:
                     if txn_retry_counter > 0:
-                        logging.debug("Committed operation %s after %d retries",
+                        logging.info("Committed operation %s after %d retries",
                                       name,
                                       txn_retry_counter)
                     return (value, txn_retry_counter)
