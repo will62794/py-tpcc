@@ -1704,8 +1704,11 @@ class MongodbDriver(AbstractDriver):
                             #   exc.code, exc.details, name)
                 # logging.info(exc.code)
                 WRITE_CONFLICT = 112
+                # Track write conflicts per transaction type.
                 if exc.code == WRITE_CONFLICT:
-                    self.num_write_conflicts += 1
+                    if name not in self.num_write_conflicts:
+                        self.num_write_conflicts[name] = 0
+                    self.num_write_conflicts[name] += 1
                 return (False, None)
             logging.error("Failed with unknown OperationFailure: %d", exc.code)
             print("Failed with unknown OperationFailure: %d" % exc.code)
