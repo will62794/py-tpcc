@@ -314,6 +314,11 @@ if __name__ == '__main__':
                          help='Print out the default configuration file for the system and exit')
     aparser.add_argument('--debug', action='store_true',
                          help='Enable debug log messages')
+    aparser.add_argument('--oneshot-mode', dest='oneshot_mode', action='store_true',
+                         help='Enable one-shot MongoDB transaction mode')
+    aparser.add_argument('--no-oneshot-mode', dest='oneshot_mode', action='store_false',
+                         help='Disable one-shot MongoDB transaction mode')
+    aparser.set_defaults(oneshot_mode=None)
     args = vars(aparser.parse_args())
 
     if args['debug']:
@@ -347,6 +352,8 @@ if __name__ == '__main__':
     if config['reset']:
         logging.info("Reseting database")
     config['warehouses'] = args['warehouses']
+    if args['oneshot_mode'] is not None:
+        config['oneshot_mode'] = str(args['oneshot_mode'])
     # Pass starting_warehouse to config for sharding setup coordination
     config['starting_warehouse'] = args.get('starting_warehouse', 1)
     driver.loadConfig(config)

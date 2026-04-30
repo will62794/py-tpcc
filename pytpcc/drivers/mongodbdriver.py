@@ -204,6 +204,7 @@ class MongodbDriver(AbstractDriver):
         "retry_writes":       ("If true, we will enable retryable writes", True),
         "causal_consistency": ("If true, we will perform causal reads ", True),
         "no_global_items":    ("If true, we will have use only one 'unsharded' items collection", False),
+        "oneshot_mode":       ("If true, use one-shot bulk-write optimized transaction paths", False),
         "shards":             ("If > 0 then sharded", "0")
     }
     DENORMALIZED_TABLES = [
@@ -237,7 +238,7 @@ class MongodbDriver(AbstractDriver):
         self.no_global_items = False
         self.shards = 0
 
-        self.oneshot_mode = True
+        self.oneshot_mode = False
 
         ## Create member mapping to collections
         for name in constants.ALL_TABLES:
@@ -274,6 +275,7 @@ class MongodbDriver(AbstractDriver):
         self.retry_writes = config['retry_writes'] == 'True'
         self.secondary_reads = config['secondary_reads'] == 'True'
         self.agg = config['agg'] == 'True'
+        self.oneshot_mode = config['oneshot_mode'] == 'True'
 
         if self.secondary_reads:
             self.read_preference = "nearest"
