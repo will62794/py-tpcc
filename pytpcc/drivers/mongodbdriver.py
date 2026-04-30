@@ -669,7 +669,7 @@ class MongodbDriver(AbstractDriver):
         o_carrier_id = params["o_carrier_id"]
         ol_delivery_d = params["ol_delivery_d"]
         d_id = params["d_id"]
-        comment = "DELIVERY " + str(d_id)
+        comment = "ONESHOT_DELIVERY " + str(d_id)
         ## getNewOrder
         new_order_query = {"NO_D_ID": d_id, "NO_W_ID": w_id, "$comment": comment}
         new_order_project = {"_id":0, "NO_D_ID":1, "NO_W_ID":1, "NO_O_ID": 1}
@@ -868,7 +868,7 @@ class MongodbDriver(AbstractDriver):
         i_w_ids = params["i_w_ids"]
         i_qtys = params["i_qtys"]
         s_dist_col = "S_DIST_%02d" % d_id
-        comment = "NEW_ORDER"
+        comment = "ONESHOT_NEW_ORDER"
 
         assert i_ids, "No matching i_ids found for new order"
         assert len(i_ids) == len(i_w_ids), "different number of i_ids and i_w_ids"
@@ -1443,7 +1443,7 @@ class MongodbDriver(AbstractDriver):
         c_id = params["c_id"]
         c_last = params["c_last"]
         h_date = params["h_date"]
-        comment = "PAYMENT"
+        comment = "ONESHOT_PAYMENT"
 
         db_name = self.database.name if self.database is not None else None
 
