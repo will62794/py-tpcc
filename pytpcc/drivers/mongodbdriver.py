@@ -41,6 +41,8 @@ import pymongo
 from pymongo.client_session import TransactionOptions
 from bson import MinKey
 
+from pymongo import monitoring
+
 import constants
 from .abstractdriver import AbstractDriver
 
@@ -189,6 +191,38 @@ TABLE_INDEXES = {
     ],
 }
 
+
+
+class MyCommandListener(monitoring.CommandListener):
+    def succeeded(self, event: monitoring.CommandSucceededEvent):
+        # print(event)
+        if event.command_name == "commitTransaction":
+            print(f"Transaction committed.")
+        # print(f"Command {event.command_name} succeeded")
+    def failed(self, event: monitoring.CommandFailedEvent):
+        print(f"Command {event.command_name} failed")
+    def started(self, event: monitoring.CommandStartedEvent):
+        if "startTransaction" in event.command:
+            print(f"Transaction started, txnNum: {event.command['txnNumber']}")
+        # print(json.dumps(event.command, indent=2, sort_keys=True, default=str))
+        # del event.command["$clusterTime"]
+        # del event.command["lsid"]
+        print(event.command)
+
+        # print(f"Command {event.command_name} started")
+
+    # Include other event method implementations here
+
+class MyServerListener(monitoring.ServerListener):
+    def heartbeat_started(self, event: monitoring.ServerHeartbeatStartedEvent):
+        print(f"Heartbeat started on server with id: {event.connection_id}")
+
+    # Include other event method implementations here
+
+class MyPoolListener(monitoring.ConnectionPoolListener):
+    def connection_created(self, event: monitoring.ConnectionCreatedEvent):
+        print(f"Connection {event.connection_id} created")
+
 ## ==============================================
 ## MongodbDriver
 ## ==============================================
@@ -312,13 +346,16 @@ class MongodbDriver(AbstractDriver):
         max_retries = 10
         for attempt in range(max_retries):
             try:
+                # listeners = [MyCommandListener()]
+                listeners = []
                 self.client = pymongo.MongoClient(real_uri,
                                                   retryWrites=self.retry_writes,
                                                   readPreference=self.read_preference,
                                                   readConcernLevel=self.read_concern,
                                                   serverSelectionTimeoutMS=30000,  # 30 second timeout
                                                   connectTimeoutMS=20000,          # 20 second connection timeout
-                                                  socketTimeoutMS=60000)           # 60 second socket timeout
+                                                  socketTimeoutMS=60000,
+                                                  event_listeners=listeners)           # 60 second socket timeout
                 logging.debug("MongoDB client connection established successfully")
                 break
             except pymongo.errors.ConfigurationError as e:
