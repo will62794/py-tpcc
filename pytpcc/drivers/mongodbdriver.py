@@ -272,6 +272,8 @@ class MongodbDriver(AbstractDriver):
         self.no_global_items = False
         self.shards = 0
 
+        self.num_write_conflicts = 0
+
         self.oneshot_mode = False
 
         ## Create member mapping to collections
@@ -1698,8 +1700,12 @@ class MongodbDriver(AbstractDriver):
             # EVEN after a bunch of retries, if we succeed eventually, we don't consider this an "abort".
             # exc.code in (24, 112, 244):  LockTimeout, WriteConflict, TransactionAborted
             if exc.has_error_label("TransientTransactionError"):
-                logging.info("OperationFailure with error code: %d (%s) during operation: %s",
-                              exc.code, exc.details, name)
+                # logging.info("OperationFailure with error code: %d (%s) during operation: %s",
+                            #   exc.code, exc.details, name)
+                # logging.info(exc.code)
+                WRITE_CONFLICT = 112
+                if exc.code == WRITE_CONFLICT:
+                    self.num_write_conflicts += 1
                 return (False, None)
             logging.error("Failed with unknown OperationFailure: %d", exc.code)
             print("Failed with unknown OperationFailure: %d" % exc.code)
@@ -1724,15 +1730,16 @@ class MongodbDriver(AbstractDriver):
             while txn_retry_counter < MAX_TXN_RETRIES: # max 100 retries to prevent endless loops
                 (ok, value) = self.run_transaction(txn_callback, s, name, params)
                 if ok:
-                    if txn_retry_counter > 0:
-                        logging.info("Committed operation %s after %d retries",
-                                      name,
-                                      txn_retry_counter)
+                    # if txn_retry_counter > 0:
+                    #     logging.info("Committed operation %s after %d retries",
+                    #                   name,
+                    #                   txn_retry_counter)
                     return (value, txn_retry_counter)
                 ## IF
 
                 # backoff a little bit before retry
                 txn_retry_counter += 1
+                # logging.info("ERROR: %s, %s", ok, value)
                 sleep(txn_retry_counter * .1)
                 logging.debug("txn retry number for %s: %d", name, txn_retry_counter)
             ## WHILE
