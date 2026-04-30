@@ -663,6 +663,90 @@ class MongodbDriver(AbstractDriver):
             if r:
                 result.append(r)
         return result
+    
+    def _doDeliveryTxn_oneshot(self, s, params):
+        w_id = params["w_id"]
+        o_carrier_id = params["o_carrier_id"]
+        ol_delivery_d = params["ol_delivery_d"]
+        d_id = params["d_id"]
+        comment = "DELIVERY " + str(d_id)
+        ## getNewOrder
+        new_order_query = {"NO_D_ID": d_id, "NO_W_ID": w_id, "$comment": comment}
+        new_order_project = {"_id":0, "NO_D_ID":1, "NO_W_ID":1, "NO_O_ID": 1}
+
+        db_name = self.database.name if self.database is not None else None
+
+
+        no_cursor = self.new_order.find(new_order_query,
+                                        new_order_project,
+                                        session=s).sort([("NO_O_ID", 1)]).limit(1)
+        no_converted_cursor = list(no_cursor)
+        if not no_converted_cursor:
+            ## No orders for this district: skip it. Note: This must be reported if > 1%
+            return None
+        ## IF
+        no = no_converted_cursor[0]
+        ## IF
+
+        o_id = no["NO_O_ID"]
+        assert o_id, "o_id cannot be missing for delivery"
+
+        ## getCId
+        order_query = {"O_ID": o_id, "O_D_ID": d_id, "O_W_ID": w_id, "$comment": comment}
+        o = self.orders.find_one(order_query, session=s)
+
+        assert o, "o cannot be none, delivery"
+        c_id = o["O_C_ID"]
+
+        ## sumOLAmount + updateOrderLine
+        ol_total = 0
+        order_lines = o["ORDER_LINE"]
+
+        ol_total = sum([ol["OL_AMOUNT"] for ol in order_lines])
+
+        assert ol_total > 0, "ol_total is 0"
+
+        ###
+        ### READ PHASE DONE
+        ###
+
+        oneshot_updates = []
+
+        ## updateOrders
+        # self.orders.update_one({"_id": o['_id'], "$comment": comment},
+        #                         {"$set": {"O_CARRIER_ID": o_carrier_id,
+        #                                     "ORDER_LINE.$[].OL_DELIVERY_D": ol_delivery_d}},
+        #                         session=s)
+        oneshot_updates.append(pymongo.UpdateOne({"_id": o['_id'], "$comment": comment},
+                                {"$set": {"O_CARRIER_ID": o_carrier_id,
+                                            "ORDER_LINE.$[].OL_DELIVERY_D": ol_delivery_d}},
+                                namespace=f"{db_name}.ORDERS"))
+
+
+        ## IF
+
+        ## updateCustomer
+        # self.customer.update_one({"C_ID": c_id, "C_D_ID": d_id, "C_W_ID": w_id, "$comment": comment},
+                                #  {"$inc": {"C_BALANCE": ol_total}}, session=s)
+        oneshot_updates.append(pymongo.UpdateOne({"C_ID": c_id, "C_D_ID": d_id, "C_W_ID": w_id, "$comment": comment},
+                                {"$inc": {"C_BALANCE": ol_total}},
+                                namespace=f"{db_name}.CUSTOMER"))
+
+        ## deleteNewOrder
+        # self.new_order.delete_one(no, session=s)
+        oneshot_updates.append(pymongo.DeleteOne(no, namespace=f"{db_name}.NEW_ORDER"))
+
+        # These must be logged in the "result file" according to TPC-C 2.7.2.2 (page 39)
+        # We remove the queued time, completed time, w_id, and o_carrier_id: the client can figure
+        # them out
+        # If there are no order lines, SUM returns null. There should always be order lines.
+        assert ol_total, "ol_total is NULL: there are no order lines. This should not happen"
+        assert ol_total > 0.0, "ol_total is 0"
+
+        # Execute all the oneshot updates.
+        self.client.bulk_write(oneshot_updates, session=s)
+
+        return (d_id, o_id)
 
     def _doDeliveryTxn(self, s, params):
         w_id = params["w_id"]
@@ -670,6 +754,10 @@ class MongodbDriver(AbstractDriver):
         ol_delivery_d = params["ol_delivery_d"]
         d_id = params["d_id"]
         comment = "DELIVERY " + str(d_id)
+
+        if self.oneshot_mode:
+            return self._doDeliveryTxn_oneshot(s, params)
+        
         ## getNewOrder
         new_order_query = {"NO_D_ID": d_id, "NO_W_ID": w_id, "$comment": comment}
         new_order_project = {"_id":0, "NO_D_ID":1, "NO_W_ID":1, "NO_O_ID": 1}
