@@ -40,6 +40,7 @@ from time import sleep
 import pymongo
 from pymongo.client_session import TransactionOptions
 from bson import MinKey
+import time
 
 from pymongo import monitoring
 
@@ -272,7 +273,7 @@ class MongodbDriver(AbstractDriver):
         self.no_global_items = False
         self.shards = 0
 
-        self.num_write_conflicts = 0
+        self.num_write_conflicts = {}
 
         self.oneshot_mode = False
 
@@ -348,8 +349,9 @@ class MongodbDriver(AbstractDriver):
         max_retries = 10
         for attempt in range(max_retries):
             try:
-                # listeners = [MyCommandListener()]
-                listeners = []
+                listeners = [
+                    # MyCommandListener()
+                ]
                 self.client = pymongo.MongoClient(real_uri,
                                                   retryWrites=self.retry_writes,
                                                   readPreference=self.read_preference,
@@ -620,6 +622,7 @@ class MongodbDriver(AbstractDriver):
             logging.debug("Closing MongoDB client connection")
             self.client.close()
             self.client = None
+            logging.info("Number of write conflicts: %s", self.num_write_conflicts)
 
     def loadFinish(self):
         logging.debug("Load finished")
@@ -895,6 +898,9 @@ class MongodbDriver(AbstractDriver):
         #######################
         #######################
 
+        # time.sleep(0.005)
+   
+
 
         #
         # After completing the read phase of this transaction, we should be able
@@ -913,13 +919,13 @@ class MongodbDriver(AbstractDriver):
 
         #############################################################################################################
         # self.district.update_one(d, {"$inc": {"D_NEXT_O_ID": 1}}, session=s)
-        oneshot_updates.append(pymongo.UpdateOne(d, {"$inc": {"D_NEXT_O_ID": 1}}, namespace=f"{db_name}.district"))
+        oneshot_updates.append(pymongo.UpdateOne(d, {"$inc": {"D_NEXT_O_ID": 1}}, namespace=f"{db_name}.DISTRICT"))
 
         # createNewOrder
 
         #############################################################################################################
         # self.new_order.insert_one({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, session=s)
-        oneshot_updates.append(pymongo.InsertOne({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, namespace=f"{db_name}.new_order"))
+        oneshot_updates.append(pymongo.InsertOne({"NO_O_ID": d_next_o_id, "NO_D_ID": d_id, "NO_W_ID": w_id}, namespace=f"{db_name}.NEW_ORDER"))
 
         o = {"O_ID": d_next_o_id, "O_ENTRY_D": o_entry_d,
              "O_CARRIER_ID": o_carrier_id, "O_OL_CNT": ol_cnt, "O_ALL_LOCAL": all_local}
@@ -984,7 +990,7 @@ class MongodbDriver(AbstractDriver):
                                            "S_REMOTE_CNT": s_remote_cnt}}
             si["$comment"] = comment
             #############################################################################################################
-            stock_writes.append(pymongo.UpdateOne(si, stock_write_update, namespace=f"{db_name}.stock"))
+            stock_writes.append(pymongo.UpdateOne(si, stock_write_update, namespace=f"{db_name}.STOCK"))
 
             if i_data.find(constants.ORIGINAL_STRING) != -1 and s_data.find(constants.ORIGINAL_STRING) != -1:
                 brand_generic = 'B'
@@ -1020,7 +1026,7 @@ class MongodbDriver(AbstractDriver):
         # createOrder
         #############################################################################################################
         # self.orders.insert_one(o, session=s)
-        oneshot_updates.append(pymongo.InsertOne(o, namespace=f"{db_name}.orders"))
+        oneshot_updates.append(pymongo.InsertOne(o, namespace=f"{db_name}.ORDERS"))
 
         #
         # Execute all the updates in one bulk write.
@@ -1416,13 +1422,13 @@ class MongodbDriver(AbstractDriver):
         #                             session=s) # can update to specify by _id?
         oneshot_updates.append(pymongo.UpdateOne({"_id": w["_id"], "W_ID": w_id, "$comment": comment},
                                     {"$inc": {"W_YTD": h_amount}},
-                                    namespace=f"{db_name}.warehouse"))
+                                    namespace=f"{db_name}.WAREHOUSE"))
         # updateDistrictBalance
         # self.district.update_one({"D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
         #                             {"$inc": {"D_YTD": h_amount}}, session=s) # can update to specify by _id?
         oneshot_updates.append(pymongo.UpdateOne({"_id": d["_id"], "D_W_ID": w_id, "D_ID": d_id, "$comment": comment},
                                     {"$inc": {"D_YTD": h_amount}},
-                                    namespace=f"{db_name}.district"))
+                                    namespace=f"{db_name}.DISTRICT"))
 
         c_data = c["C_DATA"]
 
@@ -1451,11 +1457,11 @@ class MongodbDriver(AbstractDriver):
 
         # updateCustomer
         # self.customer.update_one({"_id": c["_id"], "C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, session=s)
-        oneshot_updates.append(pymongo.UpdateOne({"_id": c["_id"], "C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, namespace=f"{db_name}.customer"))
+        oneshot_updates.append(pymongo.UpdateOne({"_id": c["_id"], "C_W_ID": c_w_id, "C_D_ID": c_d_id, "C_ID": c_id, "$comment": comment}, customer_update, namespace=f"{db_name}.CUSTOMER"))
 
         # insertHistory
         # self.history.insert_one(h, session=s)
-        oneshot_updates.append(pymongo.InsertOne(h, namespace=f"{db_name}.history"))
+        oneshot_updates.append(pymongo.InsertOne(h, namespace=f"{db_name}.HISTORY"))
 
         # TPC-C 2.5.3.3: Must display the following fields:
         # W_ID, D_ID, C_ID, C_D_ID, C_W_ID, W_STREET_1, W_STREET_2, W_CITY, W_STATE, W_ZIP,
