@@ -1696,12 +1696,28 @@ class MongodbDriver(AbstractDriver):
         return int(result)
 
     def run_transaction(self, txn_callback, session, name, params):
+        WRITE_CONFLICT_ERR_CODE = 112
+
         if self.no_transactions:
             return (True, txn_callback(session, params))
         try:
             # this implicitly commits on success
             with session.start_transaction():
                 return (True, txn_callback(session, params))
+        except pymongo.errors.ClientBulkWriteException as exc:
+            # logging.info("%s", exc.details.get("error").code)
+            if exc.details.get("error").has_error_label("TransientTransactionError"):
+                if exc.details.get("error").code == WRITE_CONFLICT_ERR_CODE:
+                    if name not in self.num_write_conflicts:
+                        self.num_write_conflicts[name] = 0
+                    self.num_write_conflicts[name] += 1
+                return (False, None)    
+            # logging.info("%s", exc.details["error"]) 
+            logging.error("Failed with unknown OperationFailure: %d", exc.code)
+            print("Failed with unknown OperationFailure: %d" % exc.code)
+            print(exc.details)
+            raise
+
         except pymongo.errors.OperationFailure as exc:
             # EVEN after a bunch of retries, if we succeed eventually, we don't consider this an "abort".
             # exc.code in (24, 112, 244):  LockTimeout, WriteConflict, TransactionAborted
@@ -1709,9 +1725,8 @@ class MongodbDriver(AbstractDriver):
                 # logging.info("OperationFailure with error code: %d (%s) during operation: %s",
                             #   exc.code, exc.details, name)
                 # logging.info(exc.code)
-                WRITE_CONFLICT = 112
                 # Track write conflicts per transaction type.
-                if exc.code == WRITE_CONFLICT:
+                if exc.code == WRITE_CONFLICT_ERR_CODE:
                     if name not in self.num_write_conflicts:
                         self.num_write_conflicts[name] = 0
                     self.num_write_conflicts[name] += 1
